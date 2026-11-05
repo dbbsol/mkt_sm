@@ -1,126 +1,54 @@
 """
 config/niches.py
 ─────────────────────────────────────────────────────────────────
-BANCO DE NICHOS — camada de configuração que torna o sistema
-replicável para qualquer profissão sem tocar em core/.
+Nichos macro do mercado + opções de tom de voz e rede social.
 
-Esta instância está configurada para profissionais de Social Media,
-Marketing Digital e Estratégia de Posicionamento (mkt_sm). Para
-clonar de volta pro nicho de nutrição (ou qualquer outro), basta
-trocar PROFISSIONAL_ATIVO e/ou completar outra entrada abaixo.
+Para ADICIONAR um nicho, basta incluir uma linha em _NICHOS_RAW:
+    (nome, emoji, [palavras-chave], editoria_google_news)
+
+editoria_google_news: BUSINESS | TECHNOLOGY | HEALTH | SCIENCE |
+                      ENTERTAINMENT | SPORTS | NATION | WORLD
 ─────────────────────────────────────────────────────────────────
 """
 
-PROFISSIONAL_ATIVO = "social_media_marketing"
+_NICHOS_RAW = [
+    ("Negócios & Empreendedorismo", "🏢", ["negócios", "empreendedorismo", "startups", "liderança", "gestão", "pequenas empresas"], "BUSINESS"),
+    ("Marketing & Vendas", "📣", ["marketing", "vendas", "tráfego pago", "redes sociais", "publicidade", "branding"], "BUSINESS"),
+    ("Finanças & Investimentos", "📈", ["finanças", "investimentos", "bolsa de valores", "juros", "dólar", "criptomoedas"], "BUSINESS"),
+    ("Tecnologia & IA", "🤖", ["tecnologia", "inteligência artificial", "software", "aplicativos", "automação", "big tech"], "TECHNOLOGY"),
+    ("Saúde & Medicina", "🩺", ["saúde", "medicina", "médicos", "hospital", "tratamento", "doenças"], "HEALTH"),
+    ("Bem-estar, Nutrição & Fitness", "💪", ["fitness", "treino", "academia", "nutrição", "emagrecimento", "bem-estar"], "HEALTH"),
+    ("Saúde Mental & Psicologia", "🧠", ["psicologia", "terapia", "saúde mental", "ansiedade", "autoconhecimento", "psicanálise"], "HEALTH"),
+    ("Beleza & Estética", "💄", ["beleza", "estética", "skincare", "cabelo", "maquiagem", "cosméticos"], "ENTERTAINMENT"),
+    ("Moda & Lifestyle", "👗", ["moda", "estilo", "lifestyle", "tendências fashion", "look", "luxo"], "ENTERTAINMENT"),
+    ("Gastronomia & Alimentação", "🍽️", ["gastronomia", "receitas", "restaurantes", "culinária", "chef", "alimentação"], "ENTERTAINMENT"),
+    ("Educação & Carreira", "🎓", ["educação", "carreira", "concursos", "enem", "faculdade", "mercado de trabalho"], "NATION"),
+    ("Direito & Jurídico", "⚖️", ["direito", "justiça", "STF", "advocacia", "legislação", "LGPD"], "NATION"),
+    ("Imóveis & Construção", "🏠", ["imóveis", "construção civil", "financiamento imobiliário", "aluguel", "incorporadoras"], "BUSINESS"),
+    ("Arquitetura, Decoração & Casa", "🛋️", ["decoração", "arquitetura", "design de interiores", "reforma", "casa"], "ENTERTAINMENT"),
+    ("Automotivo & Mobilidade", "🚗", ["carros", "automóveis", "carros elétricos", "motos", "mobilidade", "combustível"], "BUSINESS"),
+    ("Pets & Animais", "🐾", ["pets", "animais", "cachorro", "gato", "veterinário", "adoção"], "ENTERTAINMENT"),
+    ("Viagem & Turismo", "✈️", ["viagem", "turismo", "destinos", "passagens aéreas", "hotéis", "férias"], "ENTERTAINMENT"),
+    ("Arte, Design & Criatividade", "🎨", ["arte", "design", "fotografia", "ilustração", "criatividade", "exposição"], "ENTERTAINMENT"),
+    ("Esportes", "⚽", ["esporte", "futebol", "atletas", "campeonato", "olimpíadas", "treino"], "SPORTS"),
+    ("Games & Cultura Geek", "🎮", ["games", "jogos", "streaming", "esports", "cultura geek", "anime"], "TECHNOLOGY"),
+    ("Música, Cinema & Entretenimento", "🎬", ["música", "cinema", "séries", "celebridades", "shows", "streaming"], "ENTERTAINMENT"),
+    ("Agro, Clima & Sustentabilidade", "🌱", ["agronegócio", "sustentabilidade", "clima", "meio ambiente", "energia renovável", "agricultura"], "SCIENCE"),
+    ("Maternidade, Família & Infância", "👶", ["maternidade", "família", "filhos", "gravidez", "educação infantil", "parentalidade"], "HEALTH"),
+    ("Espiritualidade & Religião", "🕊️", ["espiritualidade", "religião", "fé", "meditação", "igreja", "astrologia"], "NATION"),
+    ("Eventos, Casamentos & Festas", "💍", ["eventos", "casamento", "festas", "formatura", "cerimonial", "buffet"], "ENTERTAINMENT"),
+    ("Indústria, Logística & Comércio Exterior", "🏭", ["indústria", "logística", "exportação", "importação", "transporte", "cadeia de suprimentos"], "BUSINESS"),
+    ("Varejo & E-commerce", "🛒", ["varejo", "e-commerce", "lojas", "consumo", "marketplace", "black friday"], "BUSINESS"),
+    ("Serviços Locais & Autônomos", "🛠️", ["serviços", "autônomos", "MEI", "prestador de serviços", "freelancer", "pequeno negócio"], "BUSINESS"),
+    ("Causas Sociais & Terceiro Setor", "🤝", ["ONG", "voluntariado", "causas sociais", "impacto social", "solidariedade", "inclusão"], "NATION"),
+    ("Geral / Outro nicho", "🌐", ["tendências", "viral", "novidades", "comportamento", "consumo", "cultura"], "NATION"),
+]
 
-PROFISSOES = {
-    "social_media_marketing": {
-        "nome_exibicao": "Social Media & Marketing Digital",
-        "artigo": "o(a)",
-        "plural": "profissionais de marketing",
-        "cta_agendamento": "agendar uma consultoria estratégica",
-        "unidade_atendimento": "consultoria",
-        # Paleta dark + verde escuro premium
-        "cor_marca_primaria": "#0E3B2E",
-        "cor_marca_secundaria": "#04120D",
-        "cor_destaque": "#4CBE93",
-        "sub_nichos": {
-            "gestao_de_trafego": {
-                "emoji": "📈",
-                "dores": [
-                    "custo por lead subindo", "fadiga de criativo", "ROAS instável",
-                    "cliente não entende o funil", "atribuição de conversão confusa",
-                ],
-                "publico_tipico": "donos de pequenas e médias empresas investindo em anúncios",
-                "linguagem": "técnica, orientada a dado, direta ao ponto",
-            },
-            "gestao_de_redes_sociais": {
-                "emoji": "📱",
-                "dores": [
-                    "engajamento caindo", "falta de tempo pra postar com consistência",
-                    "cliente pedindo resultado de vendas direto de conteúdo orgânico",
-                    "algoritmo mudando toda hora",
-                ],
-                "publico_tipico": "pequenos negócios e criadores de conteúdo",
-                "linguagem": "prática, atualizada, sem enrolação",
-            },
-            "branding_e_posicionamento": {
-                "emoji": "🎯",
-                "dores": [
-                    "marca sem diferenciação clara", "concorrência no preço",
-                    "audiência não lembra da marca", "identidade visual inconsistente",
-                ],
-                "publico_tipico": "empreendedores construindo marca pessoal ou de negócio",
-                "linguagem": "estratégica, conceitual, com storytelling",
-            },
-            "growth_e_funil": {
-                "emoji": "🚀",
-                "dores": [
-                    "topo de funil cheio, fundo vazio", "taxa de conversão baixa",
-                    "CAC maior que LTV", "dependência de um único canal de aquisição",
-                ],
-                "publico_tipico": "founders e times de marketing de startups/negócios digitais",
-                "linguagem": "orientada a métricas, testes e experimentação",
-            },
-            "marca_pessoal": {
-                "emoji": "👤",
-                "dores": [
-                    "medo de aparecer", "não saber por onde começar a criar conteúdo",
-                    "audiência pequena mas quer monetizar", "síndrome do impostor pra postar",
-                ],
-                "publico_tipico": "especialistas, consultores e profissionais liberais",
-                "linguagem": "encorajadora, mas sem papo motivacional vazio",
-            },
-            "conteudo_e_copywriting": {
-                "emoji": "✍️",
-                "dores": [
-                    "bloqueio criativo", "conteúdo genérico que não converte",
-                    "dificuldade de encontrar ângulo diferente pra tema saturado",
-                ],
-                "publico_tipico": "criadores de conteúdo e times de marketing de conteúdo",
-                "linguagem": "criativa, tática, cheia de exemplos concretos",
-            },
-        },
-        "objetivos_campanha": {
-            "atrair_seguidores": "Crescer alcance e atrair audiência qualificada",
-            "gerar_autoridade": "Posicionar como referência técnica no nicho",
-            "vender_consultas": "Converter audiência em contratos/consultorias",
-            "educar_audiencia": "Nutrir a audiência com educação estratégica de qualidade",
-            "fortalecer_marca_pessoal": "Construir identidade de marca reconhecível e memorável",
-        },
-    },
-
-    # ─── Esqueleto original de nutrição, mantido pra referência de replicação ───
-    "nutricionista": {
-        "nome_exibicao": "Nutricionista",
-        "artigo": "a",
-        "plural": "nutricionistas",
-        "cta_agendamento": "agendar uma consulta",
-        "unidade_atendimento": "consulta",
-        "cor_marca_primaria": "#0E3B2E",
-        "cor_marca_secundaria": "#04120D",
-        "cor_destaque": "#4CBE93",
-        "sub_nichos": {
-            "emagrecimento": {"emoji": "⚖️", "dores": ["efeito sanfona", "compulsão alimentar", "dietas restritivas"], "publico_tipico": "adultos 25-45 anos", "linguagem": "acolhedora"},
-        },
-        "objetivos_campanha": {
-            "atrair_seguidores": "Crescer alcance",
-            "gerar_autoridade": "Posicionar como referência",
-            "vender_consultas": "Converter em agendamentos",
-            "educar_audiencia": "Educação nutricional",
-            "fortalecer_marca_pessoal": "Marca pessoal",
-        },
-    },
+NICHOS = {
+    nome: {"emoji": emoji, "tags": tags, "topic": topic, "query": " OR ".join(tags[:4])}
+    for nome, emoji, tags, topic in _NICHOS_RAW
 }
 
+TONS = ["Autoridade", "Inspiracional", "Educativo", "Provocador", "Descontraído", "Premium / Luxo", "Viral / Humor"]
 
-def get_profissao_ativa() -> dict:
-    return PROFISSOES[PROFISSIONAL_ATIVO]
-
-
-def get_sub_nichos() -> dict:
-    return get_profissao_ativa()["sub_nichos"]
-
-
-def get_objetivos_campanha() -> dict:
-    return get_profissao_ativa()["objetivos_campanha"]
+REDES = ["Qualquer rede", "Instagram", "TikTok", "YouTube", "LinkedIn", "X (Twitter)", "Pinterest", "Blog / Newsletter"]

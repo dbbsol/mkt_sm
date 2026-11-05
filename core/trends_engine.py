@@ -1,46 +1,45 @@
 """
 core/trends_engine.py
 ─────────────────────────────────────────────────────────────────
-Motor de inteligência de tendências multi-fonte. Cada fonte é
-opcional e isolada — se uma falhar (rede fora, chave ausente, API
-fora do ar), as outras continuam funcionando normalmente.
+Motor de tendências multi-fonte, 100% gratuito (sem chave). Cada
+fonte é isolada: se uma falhar, as outras continuam.
 
-Fontes:
-  🟢 Google Trends       — RSS público, sem chave necessária
-  🟢 YouTube Data API    — precisa de YOUTUBE_API_KEY (gratuita)
-  🟢 Google News / RSS   — RSS público, sem chave necessária
-  🟢 Wikipedia/Wikimedia — API pública (Pageviews), sem chave necessária
-  🟢 Hacker News API     — API pública, sem chave necessária
-  🟢 Pinterest API       — precisa de PINTEREST_ACCESS_TOKEN (conta
-                            de negócios + app aprovado pela Pinterest;
-                            se não configurado, a fonte é pulada)
+Fontes (todas públicas):
+  🇧🇷 Google Trends Brasil / 🌍 EUA   — buscas em alta (RSS)
+  📚 Wikipédia                         — artigos mais lidos
+  🎯 Google News · seu nicho           — busca RSS pelas palavras do nicho
+  🔎 Bing News · seu nicho             — busca RSS
+  📰 Google News · editoria            — manchetes da editoria do nicho
+  🗞️ G1 / Globo                        — RSS geral
+  💬 Reddit r/brasil                   — top do dia (RSS)
+  🛠️ Hacker News                       — só para nichos de tecnologia
+  ⌨️ Google Suggest                    — buscas relacionadas ao nicho
+  ▶️ YouTube (opcional, chave gratuita YOUTUBE_API_KEY)
 
-Mapeamento propositalmente PROFUNDO (mais itens por fonte que o
-necessário mínimo) — o objetivo é dar à IA volume suficiente de
-sinal bruto pra produzir um parecer rico em exemplos e conexões,
-não uma lista curta e rasa.
-
-Além da coleta crua, este módulo:
-  - pontua cada tendência por MOMENTUM (posição de origem + confirmação
-    cruzada entre fontes + relevância semântica com o nicho);
-  - classifica o ESTÁGIO DE CICLO DE VIDA (emergente/em alta/pico/saturando);
-  - mantém rastro de QUAIS PLATAFORMAS confirmaram cada tendência, pra
-    ajudar a IA a sugerir o formato de conteúdo certo.
+Além da coleta, o módulo cruza as fontes, agrupa o que é a mesma
+pauta, ranqueia (relevância pro nicho + confirmação entre fontes +
+volume) e busca contexto extra de cada pauta para a IA destrinchar.
 ─────────────────────────────────────────────────────────────────
 """
 
 import os
 import re
+import html
+import math
 import time
 import datetime
+import unicodedata
 import xml.etree.ElementTree as ET
-from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote_plus
 
 import requests
 import feedparser
 
-_CACHE = {"timestamp": 0, "data": None, "key": None}
-_CACHE_TTL_SECONDS = 60 * 15  # 15 minutos
+from config import niches
+
+CACHE_TTL_SECONDS = 60 * 10
+_CACHE: dict = {}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -48,304 +47,389 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
 }
 
-FONTE_LABELS = {
-    "google_trends": "Google Trends",
-    "youtube": "YouTube",
-    "google_news": "Google News",
-    "wikipedia": "Wikipedia",
-    "hackernews": "Hacker News",
-    "pinterest": "Pinterest",
+# chave → (emoji, rótulo, peso no ranking)
+FONTES = {
+    "gt_br": ("🇧🇷", "Google Trends Brasil", 3.0),
+    "gt_us": ("🌍", "Google Trends EUA", 1.5),
+    "wiki": ("📚", "Wikipédia · mais lidos", 2.0),
+    "gnews_nicho": ("🎯", "Google News · seu nicho", 2.5),
+    "bing_nicho": ("🔎", "Bing News · seu nicho", 2.0),
+    "gnews_topico": ("📰", "Google News · editoria", 1.5),
+    "g1": ("🗞️", "G1 / Globo", 1.5),
+    "reddit": ("💬", "Reddit · r/brasil", 1.0),
+    "hn": ("🛠️", "Hacker News", 1.0),
+    "youtube": ("▶️", "YouTube (opcional)", 1.5),
 }
 
+FONTE_LABELS = {k: v[1] for k, v in FONTES.items()}
 
-# ─── 🟢 GOOGLE TRENDS (RSS público) ──────────────────────────────
+
+# ─── utilidades ──────────────────────────────────────────────────
+def clean_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def _get(url, timeout=10, headers=None):
+    try:
+        r = requests.get(url, headers=headers or HEADERS, timeout=timeout)
+        if r.status_code == 200 and r.content:
+            return r
+    except Exception:
+        pass
+    return None
+
+
+def _local(tag: str) -> str:
+    return tag.split("}")[-1]
+
+
+def _parse_volume(s: str) -> float:
+    try:
+        m = re.match(r"\s*([\d.,]+)\s*([a-zA-Zãõ]*)", s or "")
+        if not m:
+            return 0
+        num = float(m.group(1).replace(".", "").replace(",", "."))
+        suf = m.group(2).lower()
+        if suf.startswith("milh") or suf in ("mi", "m"):
+            num *= 1_000_000
+        elif suf.startswith("mil") or suf == "k":
+            num *= 1_000
+        return num
+    except Exception:
+        return 0
+
+
+# ─── coletores ───────────────────────────────────────────────────
 def fetch_google_trends(geo: str = "BR") -> list[dict]:
-    urls = [
-        f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}",
-        f"https://trends.google.com/trending/rss?geo={geo}",
-    ]
-    for url in urls:
+    for url in (f"https://trends.google.com/trending/rss?geo={geo}",
+                f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}"):
+        r = _get(url, 12)
+        if not r:
+            continue
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=12)
-            if resp.status_code == 200 and len(resp.content) > 200:
-                try:
-                    root = ET.fromstring(resp.content)
-                    items = []
-                    ns = {"ht": "https://trends.google.com/trends/trendingsearches/daily"}
-                    for item in root.findall(".//item")[:25]:
-                        title_el = item.find("title")
-                        traffic_el = (
-                            item.find("{https://trends.google.com/trends/trendingsearches/daily}approx_traffic")
-                            or item.find("ht:approx_traffic", ns)
-                        )
-                        if title_el is not None and title_el.text:
-                            items.append({
-                                "title": title_el.text.strip(),
-                                "source": "google_trends",
-                                "extra": traffic_el.text if traffic_el is not None else "",
-                            })
-                    if items:
-                        return items
-                except ET.ParseError:
-                    feed = feedparser.parse(resp.content)
-                    return [
-                        {"title": e.get("title", ""), "source": "google_trends", "extra": e.get("ht_approx_traffic", "")}
-                        for e in feed.entries[:25] if e.get("title")
-                    ]
+            root = ET.fromstring(r.content)
+        except ET.ParseError:
+            continue
+        items = []
+        for it in root.iter("item"):
+            title, traffic, news = None, "", []
+            for ch in it:
+                n = _local(ch.tag)
+                if n == "title":
+                    title = (ch.text or "").strip()
+                elif n == "approx_traffic":
+                    traffic = (ch.text or "").strip()
+                elif n == "news_item":
+                    d = {_local(sub.tag): (sub.text or "").strip() for sub in ch}
+                    if d.get("news_item_title"):
+                        news.append({
+                            "titulo": clean_html(d["news_item_title"]),
+                            "resumo": clean_html(d.get("news_item_snippet", "")),
+                            "fonte": d.get("news_item_source", ""),
+                            "link": d.get("news_item_url", ""),
+                        })
+            if title:
+                items.append({"titulo": title, "tipo": "busca", "trafego": traffic,
+                              "volume": _parse_volume(traffic), "contexto": news[:3]})
+        if items:
+            return items[:20]
+    return []
+
+
+def fetch_rss(url, label="", max_items=12, tipo="noticia", strip_source=False) -> list[dict]:
+    r = _get(url, 10)
+    if not r:
+        return []
+    feed = feedparser.parse(r.content)
+    out = []
+    for e in feed.entries[:max_items]:
+        title = clean_html(e.get("title", ""))
+        fonte = label
+        src = e.get("source")
+        if isinstance(src, dict) and src.get("title"):
+            fonte = src["title"]
+        if strip_source and " - " in title:
+            title, _, tail = title.rpartition(" - ")
+            fonte = fonte or tail
+        resumo = clean_html(e.get("summary", "") or e.get("description", ""))[:240]
+        if title:
+            out.append({"titulo": title, "resumo": resumo, "fonte": fonte or label,
+                        "link": e.get("link", ""), "tipo": tipo})
+    return out
+
+
+def fetch_gnews_search(query: str, limit: int = 10) -> list[dict]:
+    q = quote_plus(f"{query} when:2d")
+    return fetch_rss(f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+                     "Google News", limit, strip_source=True)
+
+
+def fetch_gnews_topic(topic: str) -> list[dict]:
+    return fetch_rss(f"https://news.google.com/rss/headlines/section/topic/{topic}?hl=pt-BR&gl=BR&ceid=BR:pt-419",
+                     "Google News", 10, strip_source=True)
+
+
+def fetch_bing(query: str) -> list[dict]:
+    return fetch_rss(f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss&setmkt=pt-BR",
+                     "Bing News", 10)
+
+
+def fetch_wikipedia() -> list[dict]:
+    base = datetime.datetime.utcnow()
+    for back in (1, 2, 3):
+        d = base - datetime.timedelta(days=back)
+        url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/top/pt.wikipedia/all-access/{d.year}/{d.month:02d}/{d.day:02d}"
+        r = _get(url, 10, {"User-Agent": "InteligenciaEditorial/1.0 (streamlit app)", "Accept": "application/json"})
+        if not r:
+            continue
+        try:
+            arts = r.json()["items"][0]["articles"]
         except Exception:
             continue
-    return []
-
-
-# ─── 🟢 YOUTUBE DATA API (precisa de YOUTUBE_API_KEY) ────────────
-def fetch_youtube_trending(keywords: list[str], region: str = "BR") -> list[dict]:
-    api_key = os.environ.get("YOUTUBE_API_KEY", "")
-    if not api_key or not keywords:
-        return []
-    query = " | ".join(keywords[:6])
-    published_after = (datetime.datetime.utcnow() - datetime.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = "https://www.googleapis.com/youtube/v3/search"
-    params = {
-        "part": "snippet", "q": query, "type": "video", "order": "viewCount",
-        "publishedAfter": published_after, "maxResults": 20, "regionCode": region,
-        "relevanceLanguage": "pt", "key": api_key,
-    }
-    try:
-        resp = requests.get(url, params=params, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            return [
-                {
-                    "title": item["snippet"]["title"],
-                    "source": "youtube",
-                    "extra": item["snippet"].get("channelTitle", ""),
-                }
-                for item in data.get("items", [])
-                if item.get("id", {}).get("videoId")
-            ]
-    except Exception:
-        pass
-    return []
-
-
-# ─── 🟢 GOOGLE NEWS / RSS (público) ──────────────────────────────
-def fetch_news_rss(url: str, max_items: int = 20) -> list[dict]:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code == 200:
-            feed = feedparser.parse(resp.content)
-            out = []
-            for entry in feed.entries[:max_items]:
-                title = (entry.get("title") or "").strip()
-                if title:
-                    out.append({"title": title, "source": "google_news", "extra": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else ""})
-            return out
-    except Exception:
-        pass
-    return []
-
-
-def fetch_google_news(keywords: list[str]) -> list[dict]:
-    if not keywords:
-        return []
-    query = "+OR+".join(re.sub(r"\s+", "%20", kw) for kw in keywords[:6])
-    url = f"https://news.google.com/rss/search?q={query}&hl=pt-BR&gl=BR&ceid=BR:pt"
-    return fetch_news_rss(url)
-
-
-# ─── 🟢 WIKIPEDIA / WIKIMEDIA (público) ──────────────────────────
-def fetch_wikipedia_top_articles(lang: str = "pt") -> list[dict]:
-    """Artigos mais visitados da Wikipedia no dia anterior (Wikimedia Pageviews API)."""
-    ontem = datetime.datetime.utcnow() - datetime.timedelta(days=2)  # a API costuma ter 1-2 dias de atraso
-    y, m, d = ontem.strftime("%Y"), ontem.strftime("%m"), ontem.strftime("%d")
-    url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/top/{lang}.wikipedia/all-access/{y}/{m}/{d}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            artigos = data.get("items", [{}])[0].get("articles", [])
-            ignorar = {"Main_Page", "Special:Search", "Wikipédia:Página_principal"}
-            out = []
-            for a in artigos:
-                titulo = a.get("article", "").replace("_", " ")
-                if titulo in ignorar or titulo.startswith(("Special:", "Wikipédia:", "Categoria:")):
-                    continue
-                out.append({"title": titulo, "source": "wikipedia", "extra": str(a.get("views", ""))})
-            return out[:25]
-    except Exception:
-        pass
-    return []
-
-
-# ─── 🟢 HACKER NEWS API (público) ────────────────────────────────
-def fetch_hackernews_top(limit: int = 25) -> list[dict]:
-    try:
-        resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            return []
-        ids = resp.json()[:limit]
         out = []
-        for item_id in ids:
-            try:
-                r = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json", headers=HEADERS, timeout=8)
-                if r.status_code == 200:
-                    item = r.json()
-                    if item and item.get("title"):
-                        out.append({"title": item["title"], "source": "hackernews", "extra": str(item.get("score", ""))})
-            except Exception:
+        for a in arts:
+            t = a.get("article", "").replace("_", " ")
+            if not t or ":" in t or t.lower() in ("página principal", "wikipédia"):
                 continue
-        return out
-    except Exception:
-        return []
+            v = a.get("views", 0)
+            out.append({"titulo": t, "tipo": "busca", "volume": v,
+                        "trafego": f"{v:,} leituras".replace(",", "."), "contexto": []})
+            if len(out) >= 12:
+                break
+        if out:
+            return out
+    return []
 
 
-# ─── 🟢 PINTEREST API (precisa de PINTEREST_ACCESS_TOKEN + conta aprovada) ─
-def fetch_pinterest_trends(region: str = "US", trend_type: str = "growing") -> list[dict]:
-    """
-    API oficial de Trends do Pinterest (v5). Requer conta de negócios com
-    app aprovado pela Pinterest e um Access Token OAuth — não é uma chave
-    simples. Se PINTEREST_ACCESS_TOKEN não estiver configurado, esta fonte
-    é pulada silenciosamente (ver .env.example para instruções).
-    """
-    token = os.environ.get("PINTEREST_ACCESS_TOKEN", "")
-    if not token:
+def fetch_reddit() -> list[dict]:
+    r = _get("https://www.reddit.com/r/brasil/top/.rss?t=day", 10,
+             {"User-Agent": "InteligenciaEditorial/1.0 (streamlit app)"})
+    if not r:
         return []
-    url = f"https://api.pinterest.com/v5/trends/keywords/{region}/top/{trend_type}"
+    feed = feedparser.parse(r.content)
+    out = []
+    for e in feed.entries[:10]:
+        t = clean_html(e.get("title", ""))
+        if t:
+            out.append({"titulo": t, "resumo": "", "fonte": "Reddit r/brasil", "link": e.get("link", ""), "tipo": "noticia"})
+    return out
+
+
+def fetch_hackernews(limit: int = 8) -> list[dict]:
+    r = _get("https://hacker-news.firebaseio.com/v0/topstories.json", 8)
+    if not r:
+        return []
+    out = []
     try:
-        resp = requests.get(url, headers={**HEADERS, "Authorization": f"Bearer {token}"}, params={"limit": 25}, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            return [
-                {"title": t.get("keyword", ""), "source": "pinterest", "extra": f"+{t.get('pct_growth_wow', 0)}% semana"}
-                for t in data.get("trends", []) if t.get("keyword")
-            ]
+        for i in r.json()[:limit]:
+            rr = _get(f"https://hacker-news.firebaseio.com/v0/item/{i}.json", 6)
+            if rr:
+                d = rr.json()
+                if d and d.get("title"):
+                    out.append({"titulo": d["title"], "resumo": "", "fonte": "Hacker News",
+                                "link": d.get("url") or f"https://news.ycombinator.com/item?id={i}", "tipo": "noticia"})
+    except Exception:
+        pass
+    return out
+
+
+def fetch_youtube(keywords: list[str]) -> list[dict]:
+    """Opcional. Chave gratuita do YouTube Data API em YOUTUBE_API_KEY."""
+    key = os.environ.get("YOUTUBE_API_KEY", "")
+    if not key or not keywords:
+        return []
+    after = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        r = requests.get("https://www.googleapis.com/youtube/v3/search", params={
+            "part": "snippet", "q": " | ".join(keywords[:4]), "type": "video", "order": "viewCount",
+            "publishedAfter": after, "maxResults": 10, "regionCode": "BR", "relevanceLanguage": "pt", "key": key,
+        }, timeout=12)
+        if r.status_code == 200:
+            return [{"titulo": it["snippet"]["title"], "resumo": "", "fonte": it["snippet"].get("channelTitle", "YouTube"),
+                     "link": f"https://www.youtube.com/watch?v={it['id']['videoId']}", "tipo": "noticia"}
+                    for it in r.json().get("items", []) if it.get("id", {}).get("videoId")]
     except Exception:
         pass
     return []
 
 
-# ─── COLETA CONSOLIDADA ───────────────────────────────────────────
-def _collect_raw(niche_keywords: list[str]) -> dict:
-    results, status = {}, {}
+def fetch_suggest(terms: list[str]) -> list[str]:
+    out: list[str] = []
+    for t in terms[:3]:
+        r = _get(f"https://suggestqueries.google.com/complete/search?client=firefox&hl=pt-BR&gl=br&q={quote_plus(t)}", 6)
+        if r:
+            try:
+                for s in r.json()[1][:6]:
+                    if s and s.lower() != t.lower() and s not in out:
+                        out.append(s)
+            except Exception:
+                pass
+    return out[:14]
 
-    results["google_trends"] = fetch_google_trends("BR")
-    status["google_trends"] = "online" if results["google_trends"] else "indisponivel"
 
-    results["youtube"] = fetch_youtube_trending(niche_keywords)
-    status["youtube"] = "online" if results["youtube"] else ("sem_chave" if not os.environ.get("YOUTUBE_API_KEY") else "indisponivel")
+# ─── coleta consolidada (paralela, com cache) ────────────────────
+def collect_all(nicho_nome: str, force_refresh: bool = False) -> dict:
+    now = time.time()
+    hit = _CACHE.get(nicho_nome)
+    if hit and not force_refresh and now - hit["t"] < CACHE_TTL_SECONDS:
+        return hit["data"]
 
-    results["google_news"] = fetch_google_news(niche_keywords)
-    status["google_news"] = "online" if results["google_news"] else "indisponivel"
+    nicho = niches.NICHOS[nicho_nome]
+    jobs = {
+        "gt_br": lambda: fetch_google_trends("BR"),
+        "gt_us": lambda: fetch_google_trends("US"),
+        "wiki": fetch_wikipedia,
+        "gnews_nicho": lambda: fetch_gnews_search(nicho["query"], 12),
+        "bing_nicho": lambda: fetch_bing(nicho["tags"][0] + " " + nicho["tags"][1]),
+        "gnews_topico": lambda: fetch_gnews_topic(nicho["topic"]),
+        "g1": lambda: fetch_rss("https://g1.globo.com/rss/g1/", "G1 Globo", 10),
+        "reddit": fetch_reddit,
+        "suggest": lambda: fetch_suggest(nicho["tags"]),
+    }
+    if nicho["topic"] == "TECHNOLOGY":
+        jobs["hn"] = fetch_hackernews
+    if os.environ.get("YOUTUBE_API_KEY"):
+        jobs["youtube"] = lambda: fetch_youtube(nicho["tags"])
 
-    results["wikipedia"] = fetch_wikipedia_top_articles("pt")
-    status["wikipedia"] = "online" if results["wikipedia"] else "indisponivel"
-
-    results["hackernews"] = fetch_hackernews_top()
-    status["hackernews"] = "online" if results["hackernews"] else "indisponivel"
-
-    results["pinterest"] = fetch_pinterest_trends()
-    status["pinterest"] = "online" if results["pinterest"] else ("sem_chave" if not os.environ.get("PINTEREST_ACCESS_TOKEN") else "indisponivel")
-
-    results["_status"] = status
-    results["_coletado_em"] = datetime.datetime.now().isoformat()
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {k: ex.submit(fn) for k, fn in jobs.items()}
+        for k, f in futs.items():
+            try:
+                results[k] = f.result(timeout=40)
+            except Exception:
+                results[k] = []
+    _CACHE[nicho_nome] = {"t": now, "data": results}
     return results
 
 
-def collect_trends(niche_keywords: list[str], force_refresh: bool = False) -> dict:
-    """Coleta com cache TTL (15min) pra não sobrecarregar as fontes externas."""
-    now = time.time()
-    cache_key = tuple(sorted(niche_keywords))
-    if not force_refresh and _CACHE["data"] and _CACHE.get("key") == cache_key and (now - _CACHE["timestamp"] < _CACHE_TTL_SECONDS):
-        return _CACHE["data"]
-    data = _collect_raw(niche_keywords)
-    _CACHE["timestamp"] = now
-    _CACHE["key"] = cache_key
-    _CACHE["data"] = data
-    return data
+def status_fontes(data: dict) -> dict:
+    return {k: ("ok" if data.get(k) else "off") for k in list(FONTES) + ["suggest"] if k in data}
 
 
-# ─── MATCHING SEMÂNTICO COM O NICHO ──────────────────────────────
-def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-zà-ú]{4,}", text.lower()))
+# ─── cruzamento, deduplicação e ranking ──────────────────────────
+_STOP = set("para como sobre mais esta esse esses essas apos entre quando onde pela pelo pelos pelas dele dela seus suas isso essa este "
+            "numa nesta neste desta deste ainda tambem depois antes contra sem com uma uns umas que por dos das nos nas aos foi sao ser tem ter "
+            "vai vem mas the and for with from after about into over".split())
 
 
-def score_semantic_relevance(item_title: str, niche_keywords: list[str]) -> float:
-    title_tokens = _tokenize(item_title)
-    keyword_tokens = set()
-    for kw in niche_keywords:
-        keyword_tokens |= _tokenize(kw)
-    if not title_tokens or not keyword_tokens:
-        return 0.0
-    overlap = title_tokens & keyword_tokens
-    return round(len(overlap) / max(len(keyword_tokens), 1), 3)
+def _toks(s: str) -> set[str]:
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return {w for w in re.findall(r"[a-z0-9]{3,}", s) if w not in _STOP}
 
 
-# ─── MOMENTUM + CICLO DE VIDA + PLATAFORMAS ──────────────────────
-def _lifecycle_stage(source_count: int, position: int) -> str:
-    if source_count >= 3:
-        return "PICO"
-    if source_count == 2:
-        return "EM ALTA"
-    if position <= 3:
-        return "EMERGENTE"
-    return "SATURANDO" if position > 12 else "EM ALTA"
+def build_clusters(data: dict, nicho_nome: str) -> list[dict]:
+    nicho = niches.NICHOS[nicho_nome]
+    items = []
+    for key, lst in data.items():
+        if key == "suggest" or not isinstance(lst, list):
+            continue
+        for it in lst:
+            it = dict(it)
+            it["src"] = key
+            items.append(it)
+    items.sort(key=lambda x: 0 if x.get("tipo") == "busca" else 1)
 
-
-def build_trend_intelligence(raw: dict, niche_keywords: list[str], top_n: int = 25) -> list[dict]:
-    """
-    Funde todas as fontes coletadas numa lista única ranqueada, com score
-    de momentum, estágio de ciclo de vida e as plataformas que confirmaram
-    cada tendência. top_n é propositalmente alto (25) pra dar à IA volume
-    suficiente de material bruto e ela produzir um parecer rico em exemplos.
-    """
-    title_counter = Counter()
-    title_first_pos = {}
-    title_meta = {}
-    title_plataformas = defaultdict(set)
-
-    for fonte_key in ["google_trends", "youtube", "google_news", "wikipedia", "hackernews", "pinterest"]:
-        lst = raw.get(fonte_key, [])
-        for pos, item in enumerate(lst):
-            title = item.get("title", "").strip()
-            if not title:
+    clusters: list[dict] = []
+    for it in items:
+        tk = _toks(it["titulo"])
+        tgt = None
+        for c in clusters:
+            if not tk or not c["tokens"]:
+                if it["titulo"].lower() == c["titulo"].lower():
+                    tgt = c
+                    break
                 continue
-            key = title.lower()
-            title_counter[key] += 1
-            title_plataformas[key].add(fonte_key)
-            if key not in title_first_pos:
-                title_first_pos[key] = pos
-                title_meta[key] = title
+            jac = len(tk & c["tokens"]) / len(tk | c["tokens"])
+            sub = (c["tipo"] == "busca" and c["tokens"] <= tk and
+                   (len(c["tokens"]) >= 2 or max(len(w) for w in c["tokens"]) >= 6))
+            if jac >= 0.5 or sub:
+                tgt = c
+                break
+        if tgt is None:
+            tgt = {"titulo": it["titulo"], "tokens": tk, "tipo": it.get("tipo"), "fontes": [],
+                   "contexto": [], "volume": 0, "trafego": ""}
+            clusters.append(tgt)
+        if it["src"] not in tgt["fontes"]:
+            tgt["fontes"].append(it["src"])
+        tgt["volume"] = max(tgt["volume"], it.get("volume", 0) or 0)
+        if it.get("trafego") and not tgt["trafego"]:
+            tgt["trafego"] = it["trafego"]
+        ctxs = it.get("contexto") or []
+        if it.get("tipo") == "noticia":
+            ctxs = [{"titulo": it["titulo"], "resumo": it.get("resumo", ""),
+                     "fonte": it.get("fonte") or FONTE_LABELS.get(it["src"], ""), "link": it.get("link", "")}]
+        seen = {x["titulo"] for x in tgt["contexto"]}
+        for cx in ctxs:
+            if cx["titulo"] not in seen:
+                tgt["contexto"].append(cx)
+                seen.add(cx["titulo"])
 
-    scored = []
-    for key, source_count in title_counter.items():
-        title = title_meta[key]
-        pos = title_first_pos[key]
-        semantic = score_semantic_relevance(title, niche_keywords)
-        position_score = max(0, 1 - (pos / 25))
-        cross_source_score = min(source_count / 3, 1.0)
-        momentum = round((position_score * 0.35 + cross_source_score * 0.35 + semantic * 0.30) * 100, 1)
-        plataformas = sorted(title_plataformas[key])
-        scored.append({
-            "titulo": title,
-            "momentum_score": momentum,
-            "relevancia_nicho": semantic,
-            "fontes_confirmando": source_count,
-            "plataformas": [FONTE_LABELS.get(p, p) for p in plataformas],
-            "estagio": _lifecycle_stage(source_count, pos),
-        })
+    nicho_tokens: set[str] = set()
+    for t in nicho["tags"]:
+        nicho_tokens |= _toks(t)
 
-    scored.sort(key=lambda x: x["momentum_score"], reverse=True)
-    return scored[:top_n]
+    for c in clusters:
+        text = " ".join([c["titulo"]] + [x["titulo"] + " " + x.get("resumo", "") for x in c["contexto"]])
+        hits = len(nicho_tokens & _toks(text))
+        base = sum(FONTES[s][2] for s in c["fontes"])
+        multi = 1.2 * (len(c["fontes"]) - 1)
+        vol = math.log10(c["volume"]) * 0.5 if c["volume"] > 1 else 0
+        c["score"] = base + multi + min(hits, 4) * 1.5 + vol
+    return clusters
 
 
-def format_trends_for_ai(trend_intelligence: list[dict]) -> str:
-    if not trend_intelligence:
-        return "Nenhuma tendência com sinal suficiente no momento — gere leitura evergreen baseada nos insights."
-    lines = []
-    for t in trend_intelligence:
-        plataformas = ", ".join(t["plataformas"])
-        lines.append(
-            f"- {t['titulo']} | momentum: {t['momentum_score']}/100 | estágio: {t['estagio']} "
-            f"| relevância p/ nicho: {t['relevancia_nicho']} | visto em: {plataformas}"
+def select_top(clusters: list[dict], n: int) -> list[dict]:
+    """Top N por score, sem deixar uma única fonte dominar a lista."""
+    clusters = sorted(clusters, key=lambda c: c["score"], reverse=True)
+    cap = max(2, math.ceil(n / 2))
+    count: dict = {}
+    chosen = []
+    for c in clusters:
+        p = c["fontes"][0]
+        if count.get(p, 0) >= cap:
+            continue
+        chosen.append(c)
+        count[p] = count.get(p, 0) + 1
+        if len(chosen) >= n:
+            break
+    return chosen
+
+
+def enrich(chosen: list[dict]) -> None:
+    """Busca manchetes extras (Google News) para as pautas com pouco contexto."""
+    def job(c):
+        if len(c["contexto"]) >= 3:
+            return
+        seen = {x["titulo"] for x in c["contexto"]}
+        for f in fetch_gnews_search(c["titulo"], 4):
+            if f["titulo"] not in seen and len(c["contexto"]) < 4:
+                c["contexto"].append({"titulo": f["titulo"], "resumo": f.get("resumo", ""),
+                                      "fonte": f.get("fonte", ""), "link": f.get("link", "")})
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(job, chosen))
+
+
+def radar(nicho_nome: str, qtd: int, force_refresh: bool = False) -> dict:
+    """Pipeline completo: coleta → cruza → ranqueia → enriquece."""
+    data = collect_all(nicho_nome, force_refresh=force_refresh)
+    clusters = build_clusters(data, nicho_nome)
+    chosen = select_top(clusters, qtd)
+    enrich(chosen)
+    sinais = sum(len(v) for k, v in data.items() if k != "suggest" and isinstance(v, list))
+    return {"pautas": chosen, "status": status_fontes(data), "sugestoes": data.get("suggest", []), "sinais": sinais}
+
+
+def format_pautas_for_ai(pautas: list[dict]) -> str:
+    blocos = []
+    for i, c in enumerate(pautas, 1):
+        fontes = ", ".join(FONTE_LABELS.get(s, s) for s in c["fontes"])
+        linhas = [f'  - {x["titulo"]} ({x.get("fonte", "")}): {x.get("resumo", "")[:220]}' for x in c["contexto"][:4]]
+        blocos.append(
+            f'[ID {i}] PAUTA: {c["titulo"]}\n'
+            f'Sinais em: {fontes} | Volume: {c["trafego"] or "n/d"}\n'
+            f'Contexto coletado:\n' + ("\n".join(linhas) if linhas else "  (sem manchetes de apoio)")
         )
-    return "\n".join(lines)
+    return "\n\n".join(blocos)

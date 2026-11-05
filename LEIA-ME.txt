@@ -1,0 +1,3 @@
+1) Substitua o app.py da pasta mkt_sm por este.
+2) Copie a pasta .streamlit para dentro de mkt_sm (se ja existir, substitua o config.toml).
+3) Pare o streamlit (Ctrl+C) e rode de novo: streamlit run app.py
