@@ -16,6 +16,7 @@ A quantidade de pautas destrinchadas é fixa (QTD_PAUTAS).
 ─────────────────────────────────────────────────────────────────
 """
 
+import os
 import time
 import html
 import datetime
@@ -36,6 +37,22 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 load_dotenv()
+
+
+def _chave_gemini():
+    """Chave do Gemini fora do código: .streamlit/secrets.toml ou .env."""
+    try:
+        k = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        k = ""
+    return str(k or os.getenv("GEMINI_API_KEY", "")).strip().strip('"').strip("'")
+
+
+_k = _chave_gemini()
+if _k:
+    os.environ["GEMINI_API_KEY"] = _k
+    if not getattr(ai_generator, "GEMINI_API_KEY", ""):
+        ai_generator.GEMINI_API_KEY = _k
 
 # Quantidade fixa de pautas destrinchadas (não é mais uma opção na tela).
 QTD_PAUTAS = 6

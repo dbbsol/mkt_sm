@@ -27,7 +27,7 @@ from config import prompts, references
 GEMINI_API_KEY = ""   # ← cole sua chave Gemini aqui: GEMINI_API_KEY = "AIza..."
 
 # Tenta na ordem; se um modelo não existir/estiver indisponível, usa o próximo.
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-3.8-flash"]
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 KNOWLEDGE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "knowledge")
